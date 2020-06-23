@@ -1,0 +1,269 @@
+#!/bin/sh
+
+set -C  # noclobber: do not overwrite existing files with `>`; use `>|` instead
+
+EXE=$0
+ARGV=$*
+MINUTE=$((60))
+HOUR=$((60 * $MINUTE))
+DAY=$((24 * $HOUR))
+
+CONFIG="${UCRON_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ucron}"
+VERBOSE=0
+
+# usage <status>
+#
+# Print usage and exit with given status.
+usage() {
+    echo "\
+Usage: $(basename $EXE) [options]
+
+Options:
+    -h              Display this help message.
+    -v              Be more verbose.
+"
+    exit $1
+}
+
+# log <level|'warn'> <msg...>
+#
+# Log a message.
+log() {
+    if [ $1 = 'warn' ]; then
+        warn=1
+    elif [ $VERBOSE -lt $1 ]; then
+        return
+    fi
+    shift
+    echo "$(date +'%Y-%m-%d %T') [ucron:$$]${warn:+[WARN]} $*"
+    unset warn
+}
+
+# Parse command-line options.
+while getopts "hv" optchar; do
+    case $optchar in
+        h)
+            usage 0
+            ;;
+        v)
+            VERBOSE=$((VERBOSE + 1))
+            ;;
+        *)
+            echo "Unknown option '$optchar'!"
+            usage 1
+    esac
+done
+
+if [ ! -d "$CONFIG" ]; then
+    log warn "Config directory ($CONFIG) does not exist!"
+    exit 1
+fi
+
+CMDLOGFILE="$CONFIG/ucron-cmd.log"
+LOGFILE="$CONFIG/ucron.log"
+TABFILE="$CONFIG/ucrontab"
+DBFILE="$CONFIG/ucrondb"
+DBTMP="$CONFIG/ucrondb.tmp"
+
+if [ ! -f "$TABFILE" ]; then
+    log warn "ucrontab file ($TABFILE) does not exist!"
+    exit 1
+fi
+
+if [ -d "$CONFIG/bin" ]; then
+    PATH="$CONFIG/bin:$PATH"
+fi
+
+if [ -z $UCRON_DAEMON ]; then
+    # Daemonize.
+    UCRON_DAEMON=1 $EXE $ARGV 1>>$LOGFILE 2>>$LOGFILE &
+
+    log 0 "Daemon started (PID $!, logs: $LOGFILE)"
+    exit 0
+fi
+
+# trap_exit
+#
+# Exit trap handler.
+trap_exit() {
+    log 0 "Daemon exiting"
+}
+
+# trap_hup
+#
+# SIGHUP trap handler (reload data).
+trap_hup() {
+    log 1 "Removing database ($DBFILE, $DBTMP)"
+    rm -f "$DBFILE" "$DBTMP"
+
+    log 0 "Restarting to reload database ($DBFILE)"
+    UCRON_DAEMON=1 $EXE $ARGV &
+    exit 0
+}
+
+trap 'trap_exit' EXIT
+trap 'trap_hup' HUP
+
+log 0 "Daemon started"
+
+# epochtime
+#
+# Print number of seconds since UNIX epoch.
+epochtime() {
+    # Run POSIX awk, whose srand() sets the seed to the current epoch time if
+    # unspecified, and also returns the previously-set seed.
+    PATH=`getconf PATH` awk 'BEGIN{srand();print srand()}'
+}
+
+# tabload
+#
+# Load ucrontab file, creating the database if it doesn't exist.
+tabload() {
+    # Set default values.
+    LIFETIME=$((1 * $DAY))
+
+    exec 3<"$TABFILE"   # Open ucrontab file.
+
+    line=0
+
+    # Read `key=value` frontmatter in ucrontab.
+    while IFS=' =' read key value 0<&3; do
+        line=$(($line + 1))
+        if [ -z "$key" ]; then
+            continue    # Empty line.
+        fi
+
+        case "$key" in
+            ---)    # End of frontmatter reached.
+                break ;;
+            \#)     # Comment line.
+                continue ;;
+            LIFETIME)
+                LIFETIME=$value
+                ;;
+            *)
+                log warn "Unknown key '$key' in ucrontab ($TABFILE:$line)"
+                exit 1
+                ;;
+        esac
+    done
+
+    log 1 "Successfully loaded ucrontab settings ($TABFILE)"
+    log 1 "Lifetime: $LIFETIME"
+
+    if [ ! -e "$DBFILE" ]; then
+        # Database does not exist; set it up.
+        log 0 "Initializing database ($DBFILE)"
+
+        exec 4>"$DBFILE"    # Open and truncate database file.
+
+        now=`epochtime`
+
+        # Read `interval|cmd` table.
+        while IFS=' |' read interval cmd 0<&3; do
+            line=$((line + 1))
+            if [ -z "$interval" ]; then
+                continue    # Empty line.
+            fi
+
+            if [ "$interval" -lt 1 ]; then
+                log warn "Bad interval '$interval' in ucrontab ($TABFILE:$line)"
+
+                # Close and remove database.
+                exec 4<&-
+                rm $DBFILE
+                exit 1
+            fi
+
+            log 1 $interval $cmd
+
+            due=$(($now + $interval))
+            echo "$due|$interval|$cmd" >&4
+        done
+
+        exec 4<&-   # Close database file.
+
+        # Sort database in ascending timestamp order.
+        sort -n -o "$DBFILE" "$DBFILE"
+    fi
+
+    exec 3<&-   # Close ucrontab file.
+}
+
+tabload
+
+# longsleep <duration>
+#
+# Sleep for the given duration, potentially restarting to refresh lifecycle.
+longsleep() {
+    sleeptime=$1
+    if [ $sleeptime -gt $LIFETIME ]; then
+        sleeprem=$(($sleeptime - $LIFETIME))
+        sleeptime=$LIFETIME
+    fi
+
+    LIFETIME=$(($LIFETIME-$sleeptime))
+
+    log 1 "Sleeping for $sleeptime s${sleeprem:+ (remaining: $sleeprem s)}"
+    sleep $sleeptime
+
+    if [ ${sleeprem:-0} -eq 0 ]; then
+        return
+    fi
+
+    log 1 "Restarting to finish $sleeprem s of sleep"
+    UCRON_DAEMON=1 UCRON_LONGSLEEP=$sleeprem $EXE $ARGV &
+    exit 0
+}
+
+if [ ! -z $UCRON_LONGSLEEP ]; then
+    # More sleeping is necessary.
+    longsleep $UCRON_LONGSLEEP
+fi
+
+while true; do
+    now=`epochtime`
+
+    exec 3<"$DBFILE"    # Open database.
+
+    # Check events in database.
+    IFS=' |' read -r due interval cmd 0<&3
+    if [ -z $due ]; then
+        log warn "Bad database ($DBFILE); delete it and try again"
+        exit 1
+    fi
+
+    if [ $due -gt $now ]; then
+        # Not yet due.
+        exec 3<&-   # Close database.
+
+        # Sleep until event is due.
+        longsleep $(($due - $now))
+        continue
+    fi
+
+    # Update due time.
+    due=$(($due + $interval))
+
+    # Write out rest of database to temporary file.
+    exec 4>|"$DBTMP"
+    while IFS= read -r line 0<&3; do
+        echo $line >&4
+    done
+
+    # Append our new entry.
+    echo "$due|$interval|$cmd" >&4
+
+    exec 4<&-   # Close temporary file.
+    exec 3<&-   # Close database.
+
+    # Re-sort into database file.
+    sort -n -o "$DBFILE" "$DBTMP"
+    rm "$DBTMP"
+
+    # Start the command.
+    log 1 "Starting '$cmd' (due: $due, interval: $interval)"
+    log 0 "$cmd" >> "$CMDLOGFILE"
+    $cmd >> "$CMDLOGFILE" 2>&1 &
+done
+
